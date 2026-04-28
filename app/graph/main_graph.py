@@ -9,6 +9,9 @@ from app.graph.checkpoint import CheckpointStore
 from app.graph.routes import route_after_eva_dict
 from app.graph.state import MacpState
 from app.interfaces.memory import MockMemoryStore, MemoryStore
+from app.interfaces.mcp import MCPClient, create_mcp_client
+from app.interfaces.llm import LLMClient, OpenAILLMClient
+from app.memory import create_memory_store
 from app.memory.service import MemoryService
 
 try:
@@ -75,8 +78,8 @@ def _node_human_review(state: MacpStateDict) -> MacpStateDict:
 
 def _node_memory(state: MacpStateDict, memory_service: MemoryService) -> MacpStateDict:
     typed = MacpState.model_validate(state)
-    memory_service.persist_approved_artifact(typed)
-    typed.metadata["memory_persisted"] = True
+    persisted = memory_service.persist_approved_artifact(typed)
+    typed.metadata["memory_persisted"] = persisted
     return typed.model_dump()
 
 
@@ -89,13 +92,47 @@ class MacpGraphRunner:
         sg: SolutionGeneratorAgent | None = None,
         eva: EvaluatorAgent | None = None,
         memory_store: MemoryStore | None = None,
+        memory_mode: str = "mock",
+        mcp_client: MCPClient | None = None,
+        mcp_mode: str = "direct",
+        llm_client: LLMClient | None = None,
         checkpoint_path: str | None = "app_data/checkpoints/macp.sqlite",
     ) -> None:
-        shared_memory = memory_store or MockMemoryStore()
-        self.tm = tm or TaskManagerAgent(memory_store=shared_memory)
-        self.sg = sg or SolutionGeneratorAgent(memory_store=shared_memory)
-        self.eva = eva or EvaluatorAgent(memory_store=shared_memory)
+        """Initialize the MACP graph runner.
+
+        Args:
+            tm: Task Manager agent (optional, will be created if not provided).
+            sg: Solution Generator agent (optional, will be created if not provided).
+            eva: Evaluator agent (optional, will be created if not provided).
+            memory_store: Memory store for persistence (optional).
+            memory_mode: Memory store mode if memory_store not provided ("mock", "qdrant").
+            mcp_client: MCP client for tool calls (optional).
+            mcp_mode: MCP client mode if mcp_client not provided ("mock", "direct", "stdio", "http").
+            llm_client: LLM client for AI calls (optional, defaults to OpenAILLMClient from env).
+            checkpoint_path: Path for checkpoint storage.
+        """
+        shared_memory = memory_store or create_memory_store(mode=memory_mode)
+        shared_mcp = mcp_client or create_mcp_client(mode=mcp_mode)
+        shared_llm = llm_client or OpenAILLMClient()
+        
+        # Initialize agents with shared LLM and MCP client
+        self.tm = tm or TaskManagerAgent(
+            llm_client=shared_llm,
+            memory_store=shared_memory,
+            mcp_client=shared_mcp,
+        )
+        self.sg = sg or SolutionGeneratorAgent(
+            llm_client=shared_llm,
+            memory_store=shared_memory,
+            mcp_client=shared_mcp,
+        )
+        self.eva = eva or EvaluatorAgent(
+            llm_client=shared_llm,
+            memory_store=shared_memory,
+            mcp_client=shared_mcp,
+        )
         self.memory_service = MemoryService(shared_memory)
+        self.mcp_client = shared_mcp
         self.checkpoint_store = CheckpointStore(checkpoint_path)
         self.graph = self._build_graph()
 
@@ -160,3 +197,10 @@ class MacpGraphRunner:
 
     def close(self) -> None:
         self.checkpoint_store.close()
+        disconnect = getattr(self.mcp_client, "disconnect", None)
+        if callable(disconnect):
+            try:
+                disconnect()
+            except Exception:  # noqa: BLE001
+                # Best-effort shutdown; runner close shouldn't crash callers.
+                pass

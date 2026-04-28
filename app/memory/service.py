@@ -15,12 +15,12 @@ class MemoryService:
         hits = self.store.search(query=query, top_k=top_k, scope="global")
         state.metadata.setdefault("memory_hits", {})[agent_name] = hits
 
-    def persist_approved_artifact(self, state: MacpState) -> None:
+    def persist_approved_artifact(self, state: MacpState) -> bool:
         if not state.approved or not state.selected_candidate_id:
-            return
+            return False
         selected = next((c for c in state.candidates if c.id == state.selected_candidate_id), None)
         if selected is None:
-            return
+            return False
         score = max((ev.score for ev in state.evaluations if ev.candidate_id == selected.id), default=0.0)
         self.store.upsert(
             {
@@ -33,3 +33,4 @@ class MemoryService:
                 "candidate_id": selected.id,
             }
         )
+        return True

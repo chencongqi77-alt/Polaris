@@ -16,8 +16,6 @@ def route_after_eva(state: MacpState) -> Literal["approved", "reflect", "stop"]:
 
     if state.reflection_count >= state.max_reflections:
         return "stop"
-
-    state.reflection_count += 1
     return "reflect"
 
 

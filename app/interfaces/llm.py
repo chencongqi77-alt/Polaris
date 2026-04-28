@@ -50,6 +50,11 @@ class OpenAILLMClient:
                 "OPENAI_API_KEY is not set. "
                 "Provide it via env variable or constructor argument."
             )
+        if not self._model:
+            raise RuntimeError(
+                "OPENAI_MODEL is not set. "
+                "Provide it via env variable or constructor argument."
+            )
 
         kwargs = {"api_key": self._api_key}
         if self._base_url:

@@ -101,13 +101,14 @@ class QdrantMemoryStore(MemoryStore):
             query_filter = Filter(
                 must=[FieldCondition(key="scope", match=MatchValue(value=scope))]
             )
-        result = self.client.search(
+        # Use query_points API (qdrant-client 1.7.0+)
+        result = self.client.query_points(
             collection_name=self.collection_name,
-            query_vector=self._embed(query),
+            query=self._embed(query),
             limit=top_k,
             query_filter=query_filter,
         )
-        return [point.payload or {} for point in result]
+        return [point.payload or {} for point in result.points]
 
     def upsert(self, item: Dict[str, Any]) -> None:
         content = str(item.get("content", ""))
