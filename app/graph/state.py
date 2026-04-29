@@ -42,6 +42,11 @@ class MacpState(BaseModel):
     reflection_count: int = 0
     max_reflections: int = 3
 
-    checkpoint_id: Optional[str] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    run_checkpoint_id: Optional[str] = None
+    extra_metadata: Dict[str, Any] = Field(default_factory=dict)
     human_approved: bool = False
+
+    # Runtime fields used by graph nodes (not persisted in state contract)
+    status: str = "pending"
+    errors: List[str] = Field(default_factory=list)
+    feedback: Any = None

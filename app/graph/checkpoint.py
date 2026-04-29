@@ -13,6 +13,7 @@ class CheckpointStore:
     def __init__(self, sqlite_path: str | None = None) -> None:
         self.sqlite_path = sqlite_path
         self._conn: sqlite3.Connection | None = None
+        self.saver = self.create()
 
     def create(self):  # type: ignore[no-untyped-def]
         if not self.sqlite_path:
@@ -27,3 +28,7 @@ class CheckpointStore:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+
+# Alias used by main_graph.py
+CheckpointManager = CheckpointStore

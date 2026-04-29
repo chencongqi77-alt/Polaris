@@ -1,167 +1,216 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+import logging
+from typing import Any, Dict, Optional
 
-from app.agents.eva import EvaluatorAgent
-from app.agents.sg import SolutionGeneratorAgent
-from app.agents.tm import TaskManagerAgent
-from app.graph.checkpoint import CheckpointStore
-from app.graph.routes import route_after_eva_dict
+from langgraph.graph import END, StateGraph
+from langgraph.types import interrupt
+
+from app.agents.eva import EvaAgent
+from app.agents.sg import SolutionGeneratorAgent as SGAgent
+from app.agents.tm import TaskManagerAgent as TmAgent
+from app.graph.checkpoint import CheckpointManager
+from app.graph.routes import (
+    route_after_eva,
+    route_after_human_review,
+    route_after_sg,
+    route_after_tm,
+)
 from app.graph.state import MacpState
-from app.interfaces.memory import MockMemoryStore, MemoryStore
-from app.interfaces.mcp import MCPClient, create_mcp_client
-from app.interfaces.llm import LLMClient, OpenAILLMClient
-from app.memory import create_memory_store
-from app.memory.service import MemoryService
+from app.interfaces.mcp import MCPClient
+from app.memory import MemoryService, create_memory_store
 
-try:
-    from langgraph.graph import END, START, StateGraph
-    from langgraph.types import Command, interrupt
-except ImportError:  # pragma: no cover
-    END = "__end__"
-    START = "__start__"
-    StateGraph = None  # type: ignore[assignment]
-    Command = None  # type: ignore[assignment]
-    interrupt = None  # type: ignore[assignment]
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+log = logging.getLogger("macp.graph")
+
+# ---------------------------------------------------------------------------
+# Node functions – one per graph step
+# ---------------------------------------------------------------------------
 
 
-MacpStateDict = Dict[str, Any]
+def node_tm(state: MacpState) -> MacpState:
+    """Task Manager node: decompose user request into subtasks + constraints."""
+    log.info("[TM] Starting task management for request=%s", state.request_id)
+    try:
+        mcp = MCPClient()
+        agent = TmAgent(mcp_client=mcp)
+        agent.run(state)
+        mcp.close()
+    except Exception as exc:
+        log.error("[TM] Error: %s", exc)
+        state.errors.append(f"TM error: {exc}")
+    return state
 
 
-def _node_tm(state: MacpStateDict, tm: TaskManagerAgent) -> MacpStateDict:
-    typed = MacpState.model_validate(state)
-    updated = tm.execute(typed)
-    return updated.model_dump()
+def node_human_review(state: MacpState) -> MacpState:
+    """LangGraph interrupt-based human review."""
+    log.info("[HumanReview] Interrupting for human review")
+    state.status = "awaiting_human_review"
 
-
-def _node_sg(state: MacpStateDict, sg: SolutionGeneratorAgent) -> MacpStateDict:
-    typed = MacpState.model_validate(state)
-    updated = sg.execute(typed)
-    return updated.model_dump()
-
-
-def _node_eva(state: MacpStateDict, eva: EvaluatorAgent) -> MacpStateDict:
-    typed = MacpState.model_validate(state)
-    updated = eva.execute(typed)
-    return updated.model_dump()
-
-
-def _node_human_review(state: MacpStateDict) -> MacpStateDict:
-    if interrupt is None:
-        raise ImportError("langgraph interrupt API is unavailable.")
-
-    typed = MacpState.model_validate(state)
-    if typed.human_approved:
-        return typed.model_dump()
-
-    review_payload = {
-        "request_id": typed.request_id,
-        "message": "Review TM plan, then approve or revise.",
-        "subtasks": typed.subtasks,
-        "constraints": typed.constraints,
+    payload = {
+        "request_id": state.request_id,
+        "message": (
+            "The TM agent has finished parsing. Please review subtasks and constraints.\n"
+            "You may revise both before the SG agents start working."
+        ),
+        "subtasks": state.subtasks,
+        "constraints": state.constraints,
     }
-    review = interrupt(review_payload)
+    if state.feedback:
+        payload["feedback"] = state.feedback
 
-    if isinstance(review, dict):
-        typed.human_approved = bool(review.get("approved", False))
-        if isinstance(review.get("subtasks"), list):
-            typed.subtasks = [str(item) for item in review["subtasks"]]
-        if isinstance(review.get("constraints"), list):
-            typed.constraints = [str(item) for item in review["constraints"]]
-        typed.metadata["human_feedback"] = review
+    resume = interrupt(payload)
+
+    if not isinstance(resume, dict):
+        state.approved = False
+        state.status = "completed"
+        return state
+
+    approved = resume.get("approved", False)
+    if approved:
+        state.approved = True
+        if "subtasks" in resume:
+            state.subtasks = [str(s).strip() for s in resume["subtasks"] if str(s).strip()]
+        if "constraints" in resume:
+            state.constraints = [str(c).strip() for c in resume["constraints"] if str(c).strip()]
     else:
-        typed.human_approved = bool(review)
-        typed.metadata["human_feedback"] = {"approved": typed.human_approved}
+        state.approved = False
+        if "subtasks" in resume:
+            state.subtasks = [str(s).strip() for s in resume["subtasks"] if str(s).strip()]
+        if "constraints" in resume:
+            state.constraints = [str(c).strip() for c in resume["constraints"] if str(c).strip()]
+        if "feedback" in resume:
+            state.feedback = resume["feedback"]
+        if "notes" in resume:
+            notes = str(resume["notes"]).strip()
+            if notes:
+                state.constraints.append(f"[Human notes] {notes}")
+        state.reflection_count += 1
 
-    return typed.model_dump()
+    state.status = "human_reviewed"
+    return state
 
 
-def _node_memory(state: MacpStateDict, memory_service: MemoryService) -> MacpStateDict:
-    typed = MacpState.model_validate(state)
-    persisted = memory_service.persist_approved_artifact(typed)
-    typed.metadata["memory_persisted"] = persisted
-    return typed.model_dump()
+def node_sg(state: MacpState) -> MacpState:
+    """Solution Generator node: generate candidate solutions."""
+    log.info("[SG] Starting candidate generation for subtask")
+    try:
+        mcp = MCPClient()
+        agent = SGAgent(mcp_client=mcp)
+        agent.run(state)
+        mcp.close()
+    except Exception as exc:
+        log.error("[SG] Error: %s", exc)
+        state.errors.append(f"SG error: {exc}")
+    return state
 
+
+def node_eva(state: MacpState) -> MacpState:
+    """Evaluator node: score and select candidates."""
+    log.info("[Eva] Starting evaluation for %d candidates", len(state.candidates))
+    try:
+        mcp = MCPClient()
+        agent = EvaAgent(mcp_client=mcp)
+        agent.run(state)
+        mcp.close()
+    except Exception as exc:
+        log.error("[Eva] Error: %s", exc)
+        state.errors.append(f"Eva error: {exc}")
+    return state
+
+
+def node_memory(state: MacpState) -> MacpState:
+    """Persist approved artifacts to memory store."""
+    log.info("[Memory] Running persistence")
+    try:
+        store = create_memory_store(mode="qdrant")
+        if store is not None:
+            service = MemoryService(store)
+            service.retrieve_for_agent(state, agent_name="system")
+            persisted = service.persist_approved_artifact(state)
+            log.info("[Memory] Persisted: %s", persisted)
+            store.close()
+        else:
+            log.info("[Memory] Store unavailable, skipping")
+    except Exception as exc:
+        log.warning("[Memory] Error (continuing): %s", exc)
+    return state
+
+
+def node_end(state: MacpState) -> MacpState:
+    """Terminal node: mark state as completed."""
+    state.status = "completed"
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Graph assembly
+# ---------------------------------------------------------------------------
+
+def build_graph(checkpoint_path: Optional[str] = "app_data/checkpoints/macp.sqlite"):
+    builder = StateGraph(MacpState)
+
+    builder.add_node("TM", node_tm)
+    builder.add_node("HumanReview", node_human_review)
+    builder.add_node("SG", node_sg)
+    builder.add_node("Eva", node_eva)
+    builder.add_node("Memory", node_memory)
+    builder.add_node("End", node_end)
+
+    builder.set_entry_point("TM")
+    builder.add_conditional_edges("TM", route_after_tm, {
+        "HumanReview": "HumanReview",
+        "End": "End",
+    })
+    builder.add_conditional_edges("HumanReview", route_after_human_review, {
+        "TM": "TM",
+        "SG": "SG",
+        "End": "End",
+    })
+    builder.add_conditional_edges("SG", route_after_sg, {
+        "Eva": "Eva",
+        "End": "End",
+    })
+    builder.add_conditional_edges("Eva", route_after_eva, {
+        "SG": "SG",
+        "Memory": "Memory",
+    })
+    builder.add_edge("Memory", "End")
+    builder.add_edge("End", END)
+
+    memory_saver = None
+    if checkpoint_path:
+        try:
+            mgr = CheckpointManager(checkpoint_path)
+            memory_saver = mgr.saver
+            log.info("Checkpoint enabled: %s", checkpoint_path)
+        except Exception as exc:
+            log.warning("Checkpoint init failed (%s), running without persistence", exc)
+
+    compile_kwargs: Dict[str, Any] = {}
+    if memory_saver is not None:
+        compile_kwargs["checkpointer"] = memory_saver
+
+    return builder.compile(**compile_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Runner helpers
+# ---------------------------------------------------------------------------
 
 class MacpGraphRunner:
-    """LangGraph orchestrator with HITL interrupt and checkpoint."""
-
     def __init__(
         self,
-        tm: TaskManagerAgent | None = None,
-        sg: SolutionGeneratorAgent | None = None,
-        eva: EvaluatorAgent | None = None,
-        memory_store: MemoryStore | None = None,
-        memory_mode: str = "mock",
-        mcp_client: MCPClient | None = None,
+        memory_mode: str = "qdrant",
         mcp_mode: str = "direct",
-        llm_client: LLMClient | None = None,
-        checkpoint_path: str | None = "app_data/checkpoints/macp.sqlite",
+        checkpoint_path: Optional[str] = "app_data/checkpoints/macp.sqlite",
     ) -> None:
-        """Initialize the MACP graph runner.
-
-        Args:
-            tm: Task Manager agent (optional, will be created if not provided).
-            sg: Solution Generator agent (optional, will be created if not provided).
-            eva: Evaluator agent (optional, will be created if not provided).
-            memory_store: Memory store for persistence (optional).
-            memory_mode: Memory store mode if memory_store not provided ("mock", "qdrant").
-            mcp_client: MCP client for tool calls (optional).
-            mcp_mode: MCP client mode if mcp_client not provided ("mock", "direct", "stdio", "http").
-            llm_client: LLM client for AI calls (optional, defaults to OpenAILLMClient from env).
-            checkpoint_path: Path for checkpoint storage.
-        """
-        shared_memory = memory_store or create_memory_store(mode=memory_mode)
-        shared_mcp = mcp_client or create_mcp_client(mode=mcp_mode)
-        shared_llm = llm_client or OpenAILLMClient()
-        
-        # Initialize agents with shared LLM and MCP client
-        self.tm = tm or TaskManagerAgent(
-            llm_client=shared_llm,
-            memory_store=shared_memory,
-            mcp_client=shared_mcp,
-        )
-        self.sg = sg or SolutionGeneratorAgent(
-            llm_client=shared_llm,
-            memory_store=shared_memory,
-            mcp_client=shared_mcp,
-        )
-        self.eva = eva or EvaluatorAgent(
-            llm_client=shared_llm,
-            memory_store=shared_memory,
-            mcp_client=shared_mcp,
-        )
-        self.memory_service = MemoryService(shared_memory)
-        self.mcp_client = shared_mcp
-        self.checkpoint_store = CheckpointStore(checkpoint_path)
-        self.graph = self._build_graph()
-
-    def _build_graph(self):  # type: ignore[no-untyped-def]
-        if StateGraph is None:
-            raise ImportError(
-                "langgraph is not installed. Install it with `pip install langgraph`."
-            )
-
-        builder = StateGraph(MacpStateDict)
-        builder.add_node("tm", lambda state: _node_tm(state, self.tm))
-        builder.add_node("human_review", _node_human_review)
-        builder.add_node("sg", lambda state: _node_sg(state, self.sg))
-        builder.add_node("eva", lambda state: _node_eva(state, self.eva))
-        builder.add_node("memory", lambda state: _node_memory(state, self.memory_service))
-
-        builder.add_edge(START, "tm")
-        builder.add_edge("tm", "human_review")
-        builder.add_edge("human_review", "sg")
-        builder.add_edge("sg", "eva")
-
-        # 关键：条件边 - 实现反射循环
-        builder.add_conditional_edges(
-            "eva",
-            route_after_eva_dict,       # 路由函数
-            {"approved": "memory", "reflect": "sg", "stop": END},
-        )
-        builder.add_edge("memory", END)
-        return builder.compile(checkpointer=self.checkpoint_store.create())
+        self.memory_mode = memory_mode
+        self.mcp_mode = mcp_mode
+        self.graph = build_graph(checkpoint_path)
 
     def run(
         self,
@@ -170,37 +219,33 @@ class MacpGraphRunner:
         auto_approve_human_review: bool = True,
     ) -> MacpState:
         config = {"configurable": {"thread_id": thread_id}}
-        result = self.graph.invoke(state.model_dump(), config=config)
-        if "__interrupt__" in result:
-            if not auto_approve_human_review:
-                raise RuntimeError("Human review required. Use resume_after_human_review().")
-            result = self.graph.invoke(
-                Command(resume={"approved": True}),
-                config=config,
-            )
-        return MacpState.model_validate(result)
+        result = self.graph.invoke(state, config=config)
+        return result if isinstance(result, MacpState) else MacpState(**result)
 
     def run_until_human_review(
-        self, state: MacpState, thread_id: str = "local-thread"
+        self,
+        state: MacpState,
+        thread_id: str = "local-thread",
     ) -> Dict[str, Any]:
         config = {"configurable": {"thread_id": thread_id}}
-        return self.graph.invoke(state.model_dump(), config=config)
+        try:
+            self.graph.invoke(state, config=config)
+        except Exception as exc:
+            if "Interrupt" in type(exc).__name__ or "interrupt" in str(exc).lower():
+                log.info("Graph interrupted for human review")
+            else:
+                raise
+        snapshot = self.graph.get_state(config)
+        return snapshot.values if hasattr(snapshot, "values") else {}
 
     def resume_after_human_review(
-        self, review: Dict[str, Any], thread_id: str = "local-thread"
+        self,
+        review: Dict[str, Any],
+        thread_id: str = "local-thread",
     ) -> MacpState:
-        if Command is None:
-            raise ImportError("langgraph Command API is unavailable.")
         config = {"configurable": {"thread_id": thread_id}}
-        result = self.graph.invoke(Command(resume=review), config=config)
-        return MacpState.model_validate(result)
+        result = self.graph.invoke(review, config=config)
+        return result if isinstance(result, MacpState) else MacpState(**result)
 
     def close(self) -> None:
-        self.checkpoint_store.close()
-        disconnect = getattr(self.mcp_client, "disconnect", None)
-        if callable(disconnect):
-            try:
-                disconnect()
-            except Exception:  # noqa: BLE001
-                # Best-effort shutdown; runner close shouldn't crash callers.
-                pass
+        pass

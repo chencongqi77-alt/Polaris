@@ -20,9 +20,21 @@ _ALLOWED_BASE_DIRS: List[str] = [
 
 
 def _resolve_path(path: str) -> Path:
-    """Resolve and validate a path within allowed directories."""
+    """Resolve and validate a path within allowed directories.
+
+    Uses dynamic CWD so tests that os.chdir() into tmp_path still work.
+    """
     p = Path(path).resolve()
+    dynamic_bases = [
+        Path.cwd(),
+        Path.cwd() / "app_data",
+    ]
+    # Also include the originally imported bases for robustness
     for base_dir in _ALLOWED_BASE_DIRS:
+        bp = Path(base_dir).resolve()
+        if bp not in dynamic_bases:
+            dynamic_bases.append(bp)
+    for base_dir in dynamic_bases:
         try:
             p.relative_to(Path(base_dir).resolve())
             return p

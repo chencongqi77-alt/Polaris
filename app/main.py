@@ -30,14 +30,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--memory-mode",
-        default="mock",
-        choices=["mock", "qdrant"],
+        default="qdrant",
+        choices=["qdrant"],
         help="Memory backend.",
     )
     p.add_argument(
         "--mcp-mode",
         default="direct",
-        choices=["mock", "direct", "stdio", "http"],
+        choices=["direct", "stdio", "http"],
         help="MCP client mode for tool calls.",
     )
     p.add_argument(
@@ -103,7 +103,43 @@ def _load_review_payload(review_json: Optional[str], review_file: Optional[str])
     return payload
 
 
-def _prompt_list_edits(label: str, items: Any) -> list[str]:
+def _prompt_edit_mode() -> str:
+    """Ask user to choose between feedback mode (default) or rewrite mode."""
+    while True:
+        mode = input(
+            "\nEdit mode: [f]eedback (default) / [r]ewrite all: "
+        ).strip().lower()
+        if mode in {"f", "feedback", ""}:
+            return "feedback"
+        if mode in {"r", "rewrite"}:
+            return "rewrite"
+        print("Please enter 'f' for feedback or 'r' for rewrite.")
+
+
+def _prompt_feedback_for_items(label: str, items: list[str]) -> tuple[list[str], list[str]]:
+    """Collect per-item feedback while keeping the original list unchanged.
+
+    Returns (original_items, feedback_per_item).
+    """
+    print(f"\nCurrent {label}:")
+    if items:
+        for idx, item in enumerate(items, start=1):
+            print(f"  {idx}. {item}")
+    else:
+        print("  (empty)")
+        return items, []
+
+    print(f"\nEnter feedback for each {label[:-1]} (press Enter to skip, type feedback to add):")
+    feedbacks: list[str] = []
+    for idx, item in enumerate(items, start=1):
+        short = (item[:60] + "...") if len(item) > 60 else item
+        fb = input(f"  {idx}. {short}\n     [skip/your feedback]: ").strip()
+        feedbacks.append(fb)
+    return items, feedbacks
+
+
+def _prompt_rewrite_items(label: str, items: Any) -> list[str]:
+    """Completely replace items via user input (original behavior)."""
     normalized = [str(item).strip() for item in items if str(item).strip()] if isinstance(items, list) else []
     print(f"\nCurrent {label}:")
     if normalized:
@@ -111,10 +147,8 @@ def _prompt_list_edits(label: str, items: Any) -> list[str]:
             print(f"  {idx}. {item}")
     else:
         print("  (empty)")
-    answer = input(f"Edit {label}? [y/N]: ").strip().lower()
-    if answer not in {"y", "yes"}:
-        return normalized
 
+    print(f"\n⚠️  Enter ALL {label} to replace the current list.")
     print(f"Enter one {label[:-1]} per line. Submit an empty line to finish.")
     updated: list[str] = []
     while True:
@@ -122,7 +156,7 @@ def _prompt_list_edits(label: str, items: Any) -> list[str]:
         if not line:
             break
         updated.append(line)
-    return updated
+    return updated if updated else normalized
 
 
 def _prompt_review_action() -> str:
@@ -175,8 +209,32 @@ def _collect_interactive_review(payload: Dict[str, Any]) -> Dict[str, Any]:
     approved = action == "approve"
 
     if not approved:
-        subtasks = _prompt_list_edits("subtasks", subtasks)
-        constraints = _prompt_list_edits("constraints", constraints)
+        # Ask user which edit mode they prefer (feedback is the default)
+        mode = _prompt_edit_mode()
+
+        if mode == "feedback":
+            # Feedback mode: keep original subtasks/constraints, collect per-item notes
+            subtasks, subtask_feedbacks = _prompt_feedback_for_items("subtasks", subtasks)
+            constraints, constraint_feedbacks = _prompt_feedback_for_items("constraints", constraints)
+
+            notes = input("\nAdditional notes for SG/TM (press Enter to skip): ").strip()
+
+            review: Dict[str, Any] = {
+                "approved": False,
+                "subtasks": subtasks,
+                "constraints": constraints,
+                "feedback": {
+                    "subtask_feedback": subtask_feedbacks,
+                    "constraint_feedback": constraint_feedbacks,
+                },
+            }
+            if notes:
+                review["notes"] = notes
+            return review
+        else:
+            # Rewrite mode: replace subtasks/constraints entirely
+            subtasks = _prompt_rewrite_items("subtasks", subtasks)
+            constraints = _prompt_rewrite_items("constraints", constraints)
 
     note_prompt = "Optional approval note (press Enter to skip): " if approved else "Revision note for SG/TM: "
     notes = input(note_prompt).strip()
@@ -217,8 +275,8 @@ def _print_summary(state: MacpState) -> None:
     if state.selected_candidate_id:
         selected = next((c for c in state.candidates if c.id == state.selected_candidate_id), None)
         if selected is not None:
-            print("\n--- SELECTED CONTENT (preview) ---")
-            print(selected.content[:1200])
+            print("\n--- SELECTED CONTENT ---")
+            print(selected.content)
 
 
 def main(argv: Optional[list[str]] = None) -> int:

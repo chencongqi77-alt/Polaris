@@ -24,6 +24,7 @@ from app.mcp_server.tools import (
     register_file_tools,
     register_search_tools,
     register_calculate_tools,
+    register_web_search_tools,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,10 @@ def _register_all_tools(server: Server) -> None:
         calculate_stats,
         calculate_format_number,
         calculate_time_diff,
+    )
+    from app.mcp_server.tools.web_search import (
+        web_search_github,
+        web_search,
     )
 
     # Tool definitions with schemas
@@ -277,6 +282,32 @@ def _register_all_tools(server: Server) -> None:
                 "required": ["start_time", "end_time"],
             },
         ),
+        # Web search tools
+        Tool(
+            name="search.github",
+            description="Search GitHub repositories by keyword. Returns matching repos with name, description, URL, stars, language, and topics.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query (e.g. 'tinyml embedded', 'LLM agent framework')"},
+                    "per_page": {"type": "integer", "description": "Number of results (default 5, max 20)", "default": 5},
+                    "sort": {"type": "string", "description": "Sort by 'stars', 'forks', 'updated', or 'best-match'", "default": "stars"},
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="search.web",
+            description="Search the web for information using DuckDuckGo. Returns titles, snippets, and URLs.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query string"},
+                    "max_results": {"type": "integer", "description": "Max results to return", "default": 5},
+                },
+                "required": ["query"],
+            },
+        ),
     ]
 
     # Tool function mapping
@@ -297,6 +328,8 @@ def _register_all_tools(server: Server) -> None:
         "calculate.stats": calculate_stats,
         "calculate.format_number": calculate_format_number,
         "calculate.time_diff": calculate_time_diff,
+        "search.github": web_search_github,
+        "search.web": web_search,
     }
 
     @server.list_tools()

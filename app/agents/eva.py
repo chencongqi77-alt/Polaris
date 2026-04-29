@@ -144,3 +144,7 @@ class EvaluatorAgent(BaseAgent):
         if any(term in lowered for term in ("example", "案例", "举例")):
             score += 0.1
         return min(score, 0.95)
+
+
+# Alias for backward compatibility
+EvaAgent = EvaluatorAgent

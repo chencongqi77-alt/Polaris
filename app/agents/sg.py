@@ -51,6 +51,9 @@ class SolutionGeneratorAgent(BaseAgent):
         styles = ["structured lesson", "storytelling", "step-by-step practice"]
         feedback_instructions = self._build_revision_instructions(state)
 
+        # Research phase: gather external context via web search tools
+        research_context = self._run_research_phase(state)
+
         candidates = []
         for idx in range(k):
             prompt = self.render_prompt(
@@ -67,6 +70,8 @@ class SolutionGeneratorAgent(BaseAgent):
                 prompt += f"\nRevision guidance: {feedback_instructions}"
             if memories:
                 prompt += f"\nUseful prior artifacts: {memories}"
+            if research_context:
+                prompt += f"\nExternal research findings:\n{research_context}"
             raw = self.call_llm(prompt=prompt, temperature=0.6)
             parse_ok = True
             parse_error = ""
@@ -115,18 +120,119 @@ class SolutionGeneratorAgent(BaseAgent):
             "Prepare final version for evaluator scoring",
         ]
 
+    def _run_research_phase(self, state: MacpState) -> str:
+        """Run a research phase using web search tools to gather external context.
+
+        Extracts key topics from the user request and subtasks, searches GitHub
+        and the web for relevant information, and returns a summary string.
+
+        Args:
+            state: Current pipeline state.
+
+        Returns:
+            A string with research findings to inject into the prompt, or empty string.
+        """
+        import json as _json
+
+        research_items: list[str] = []
+
+        # Build search queries from user request and subtasks
+        queries: list[str] = []
+        user_q = state.user_request.strip()
+        if user_q:
+            # Use the first 80 chars as a search query
+            queries.append(user_q[:80])
+
+        # Add one query derived from subtasks if available
+        if state.subtasks:
+            subtask_q = " ".join(state.subtasks[:3])[:80]
+            if subtask_q and subtask_q not in queries:
+                queries.append(subtask_q)
+
+        if not queries:
+            return ""
+
+        # Search GitHub for relevant repositories
+        for q in queries[:2]:  # limit to 2 queries to avoid too many calls
+            try:
+                gh_result = self.call_mcp_tool(
+                    "search.github",
+                    {"query": q, "per_page": 3, "sort": "stars"},
+                )
+                if isinstance(gh_result, dict) and gh_result.get("status") == "ok":
+                    for repo in gh_result.get("results", [])[:3]:
+                        name = repo.get("name", "")
+                        desc = repo.get("description", "")[:120]
+                        url = repo.get("url", "")
+                        stars = repo.get("stars", 0)
+                        research_items.append(
+                            f"[GitHub] {name} ({stars}★): {desc} {url}"
+                        )
+            except Exception:
+                pass  # Non-fatal: skip on network/tool errors
+
+        # Web search for general context
+        for q in queries[:2]:
+            try:
+                web_result = self.call_mcp_tool(
+                    "search.web",
+                    {"query": q, "max_results": 3},
+                )
+                if isinstance(web_result, dict) and web_result.get("status") == "ok":
+                    for item in web_result.get("results", [])[:3]:
+                        title = item.get("title", "")[:80]
+                        snippet = item.get("snippet", "")[:120]
+                        url = item.get("url", "")
+                        research_items.append(
+                            f"[Web] {title}: {snippet} {url}"
+                        )
+            except Exception:
+                pass  # Non-fatal
+
+        if research_items:
+            # Store research in state metadata for traceability
+            agent_state = self.get_agent_state(state)
+            agent_state["research_items"] = research_items
+            return "\n".join(research_items)
+
+        return ""
+
     def _build_revision_instructions(self, state: MacpState) -> str:
         guidance: list[str] = []
-        human_feedback = state.metadata.get("human_feedback", {})
+        human_feedback = state.extra_metadata.get("human_feedback", {})
         if isinstance(human_feedback, dict):
+            notes = str(human_feedback.get("notes", "")).strip()
             if human_feedback.get("approved") is False:
-                notes = str(human_feedback.get("notes", "")).strip()
                 if notes:
                     guidance.append(f"Human reviewer requested changes: {notes}")
                 if human_feedback.get("subtasks"):
                     guidance.append("Follow the revised subtasks from human review.")
                 if human_feedback.get("constraints"):
                     guidance.append("Respect the revised constraints from human review.")
+            elif notes:
+                guidance.append(f"Human reviewer's additional request: {notes}")
+
+            # Handle per-item feedback from feedback mode (works in both approved/reject flows)
+            fb = human_feedback.get("feedback", {})
+            if isinstance(fb, dict):
+                subtask_fbs = fb.get("subtask_feedback", [])
+                if isinstance(subtask_fbs, list):
+                    for i, item_fb in enumerate(subtask_fbs):
+                        item_fb = str(item_fb).strip()
+                        if item_fb:
+                            subtask_text = ""
+                            if state.subtasks and i < len(state.subtasks):
+                                subtask_text = f" (subtask: {state.subtasks[i][:60]})"
+                            guidance.append(f"Human feedback on subtask {i + 1}{subtask_text}: {item_fb}")
+                constraint_fbs = fb.get("constraint_feedback", [])
+                if isinstance(constraint_fbs, list):
+                    for i, item_fb in enumerate(constraint_fbs):
+                        item_fb = str(item_fb).strip()
+                        if item_fb:
+                            constraint_text = ""
+                            if state.constraints and i < len(state.constraints):
+                                constraint_text = f" (constraint: {state.constraints[i][:60]})"
+                            guidance.append(f"Human feedback on constraint {i + 1}{constraint_text}: {item_fb}")
 
         if state.reflection_count > 0 and state.evaluations:
             failed_feedback = [item.feedback.strip() for item in state.evaluations if not item.passed and item.feedback.strip()]
@@ -134,3 +240,7 @@ class SolutionGeneratorAgent(BaseAgent):
                 guidance.append(f"Address Eva feedback: {' | '.join(failed_feedback[:2])}")
 
         return " ".join(guidance).strip()
+
+
+# Alias for backward compatibility
+SGAgent = SolutionGeneratorAgent

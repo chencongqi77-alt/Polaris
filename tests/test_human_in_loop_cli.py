@@ -84,12 +84,11 @@ def test_collect_interactive_review_prints_plan_before_prompt(monkeypatch, capsy
 
 def test_collect_interactive_review_allows_rewriting_lists(monkeypatch) -> None:
     answers = iter([
-        "r",
-        "y",
+        "r",        # revise action
+        "r",        # rewrite mode
         "new task 1",
         "new task 2",
         "",
-        "y",
         "constraint 1",
         "",
         "Need one more revision",
@@ -105,6 +104,33 @@ def test_collect_interactive_review_allows_rewriting_lists(monkeypatch) -> None:
         "subtasks": ["new task 1", "new task 2"],
         "constraints": ["constraint 1"],
         "notes": "Need one more revision",
+    }
+
+
+def test_collect_interactive_review_feedback_mode(monkeypatch) -> None:
+    """Feedback mode collects per-item notes without changing the list."""
+    answers = iter([
+        "r",            # revise action
+        "",             # feedback mode (default, press Enter)
+        "too vague",    # feedback for subtask 1
+        "",             # skip feedback for constraint 1
+        "Please be more specific",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+
+    review = _collect_interactive_review(
+        {"subtasks": ["old task"], "constraints": ["old constraint"]}
+    )
+
+    assert review == {
+        "approved": False,
+        "subtasks": ["old task"],
+        "constraints": ["old constraint"],
+        "feedback": {
+            "subtask_feedback": ["too vague"],
+            "constraint_feedback": [""],
+        },
+        "notes": "Please be more specific",
     }
 
 
